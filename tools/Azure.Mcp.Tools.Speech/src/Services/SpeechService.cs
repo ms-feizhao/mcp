@@ -464,4 +464,170 @@ public class SpeechService(ITenantService tenantService, ILogger<SpeechService> 
 
         return nbestResults;
     }
+
+    /// <summary>
+    /// Synthesizes speech from text and saves it to an audio file using Azure AI Services Speech.
+    /// </summary>
+    /// <param name="endpoint">Azure AI Services endpoint (e.g., https://your-service.cognitiveservices.azure.com/)</param>
+    /// <param name="text">The text to convert to speech</param>
+    /// <param name="outputFilePath">Path where the audio file will be saved</param>
+    /// <param name="language">Language for synthesis (default: en-US)</param>
+    /// <param name="voice">Voice name to use (e.g., en-US-JennyNeural). If not specified, default voice for language is used</param>
+    /// <param name="format">Output audio format (default: Riff24Khz16BitMonoPcm)</param>
+    /// <param name="endpointId">Optional endpoint ID for custom voice model</param>
+    /// <param name="retryPolicy">Optional retry policy for resilience</param>
+    /// <returns>Synthesis result with file information</returns>
+    public async Task<SynthesisResult> SynthesizeSpeechToFile(
+        string endpoint,
+        string text,
+        string outputFilePath,
+        string? language = null,
+        string? voice = null,
+        string? format = null,
+        string? endpointId = null,
+        RetryPolicyOptions? retryPolicy = null)
+    {
+        ValidateRequiredParameters((nameof(endpoint), endpoint), (nameof(text), text), (nameof(outputFilePath), outputFilePath));
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            throw new ArgumentException("Text cannot be empty or whitespace.", nameof(text));
+        }
+
+        try
+        {
+            // Get Azure AD credential and token
+            var credential = await GetCredential();
+
+            // Get access token for Cognitive Services with proper scope
+            var tokenRequestContext = new TokenRequestContext(["https://cognitiveservices.azure.com/.default"]);
+            var accessToken = await credential.GetTokenAsync(tokenRequestContext, CancellationToken.None);
+
+            // Configure Speech SDK with endpoint
+            var config = SpeechConfig.FromEndpoint(new Uri(endpoint));
+
+            // Set the authorization token
+            config.AuthorizationToken = accessToken.Token;
+
+            // Set language (default to en-US)
+            var synthesisLanguage = language ?? "en-US";
+            config.SpeechSynthesisLanguage = synthesisLanguage;
+
+            // Set voice if provided
+            string? actualVoice = voice;
+            if (!string.IsNullOrEmpty(voice))
+            {
+                config.SpeechSynthesisVoiceName = voice;
+            }
+
+            // Set output format (default to Riff24Khz16BitMonoPcm)
+            var outputFormat = ParseOutputFormat(format);
+            config.SetSpeechSynthesisOutputFormat(outputFormat);
+
+            // Set custom endpoint ID if provided
+            if (!string.IsNullOrEmpty(endpointId))
+            {
+                config.EndpointId = endpointId;
+            }
+
+            // Create audio configuration for file output
+            using var audioConfig = AudioConfig.FromWavFileOutput(outputFilePath);
+            using var synthesizer = new SpeechSynthesizer(config, audioConfig);
+
+            // Perform synthesis
+            var startTime = DateTime.UtcNow;
+            var result = await synthesizer.SpeakTextAsync(text);
+            var duration = (DateTime.UtcNow - startTime).Ticks;
+
+            // Check result
+            if (result.Reason == ResultReason.SynthesizingAudioCompleted)
+            {
+                _logger.LogInformation(
+                    "Speech synthesized successfully. Output file: {OutputFile}, Audio length: {AudioLength} bytes",
+                    outputFilePath,
+                    result.AudioData.Length);
+
+                // Get actual voice used (either specified or default)
+                if (string.IsNullOrEmpty(actualVoice))
+                {
+                    // The voice name might not be easily retrievable from result properties
+                    // Set to a default or leave as is
+                    actualVoice = voice ?? "default";
+                }
+
+                return new SynthesisResult
+                {
+                    FilePath = outputFilePath,
+                    Duration = duration,
+                    AudioLength = result.AudioData.Length,
+                    Format = format ?? "Riff24Khz16BitMonoPcm",
+                    Voice = actualVoice,
+                    Language = synthesisLanguage
+                };
+            }
+            else if (result.Reason == ResultReason.Canceled)
+            {
+                var cancellation = SpeechSynthesisCancellationDetails.FromResult(result);
+                _logger.LogError(
+                    "Speech synthesis canceled: Reason={Reason}, ErrorCode={ErrorCode}, ErrorDetails={ErrorDetails}",
+                    cancellation.Reason,
+                    cancellation.ErrorCode,
+                    cancellation.ErrorDetails);
+
+                if (IsSynthesisInvalidEndpointError(cancellation))
+                {
+                    throw new InvalidOperationException(
+                        $"Invalid endpoint or connectivity issue. Reason: {cancellation.Reason}, ErrorCode: {cancellation.ErrorCode}, Details: {cancellation.ErrorDetails}");
+                }
+
+                throw new InvalidOperationException(
+                    $"Speech synthesis failed: {cancellation.Reason} - {cancellation.ErrorDetails}");
+            }
+
+            throw new InvalidOperationException($"Speech synthesis failed with reason: {result.Reason}");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during speech synthesis.");
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Determines if the cancellation details indicate an invalid endpoint error for synthesis.
+    /// </summary>
+    /// <param name="cancellationDetails">The cancellation details from speech synthesis</param>
+    /// <returns>True if the error indicates an invalid endpoint, false otherwise</returns>
+    private static bool IsSynthesisInvalidEndpointError(SpeechSynthesisCancellationDetails cancellationDetails)
+    {
+        return cancellationDetails.Reason == CancellationReason.Error &&
+               (cancellationDetails.ErrorCode == CancellationErrorCode.ConnectionFailure ||
+                cancellationDetails.ErrorCode == CancellationErrorCode.AuthenticationFailure ||
+                cancellationDetails.ErrorCode == CancellationErrorCode.Forbidden ||
+                cancellationDetails.ErrorDetails?.Contains("endpoint", StringComparison.OrdinalIgnoreCase) == true ||
+                cancellationDetails.ErrorDetails?.Contains("connection", StringComparison.OrdinalIgnoreCase) == true ||
+                cancellationDetails.ErrorDetails?.Contains("network", StringComparison.OrdinalIgnoreCase) == true);
+    }
+
+    /// <summary>
+    /// Parses the output format string to SpeechSynthesisOutputFormat enum.
+    /// </summary>
+    /// <param name="format">Format string (e.g., "Riff24Khz16BitMonoPcm", "Audio16Khz32KBitRateMonoMp3")</param>
+    /// <returns>SpeechSynthesisOutputFormat enum value</returns>
+    private static SpeechSynthesisOutputFormat ParseOutputFormat(string? format)
+    {
+        if (string.IsNullOrEmpty(format))
+        {
+            return SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm;
+        }
+
+        // Try to parse the format string directly to enum
+        if (Enum.TryParse<SpeechSynthesisOutputFormat>(format, true, out var parsedFormat))
+        {
+            return parsedFormat;
+        }
+
+        // If parsing fails, default to Riff24Khz16BitMonoPcm
+        return SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm;
+    }
 }
