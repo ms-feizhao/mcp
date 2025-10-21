@@ -583,7 +583,7 @@ public class SpeechService(ITenantService tenantService, ILogger<SpeechService> 
 
         // Get the collected audio data from the stream
         var audioData = audioStream.ToArray();
-        
+
         _logger.LogInformation(
             "Speech synthesized successfully. Total audio length: {AudioLength} bytes",
             audioData.Length);
@@ -679,7 +679,7 @@ public class SpeechService(ITenantService tenantService, ILogger<SpeechService> 
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error during speech synthesis.");
-            
+
             // Clean up partial file on error
             if (File.Exists(outputFilePath))
             {
@@ -693,7 +693,7 @@ public class SpeechService(ITenantService tenantService, ILogger<SpeechService> 
                     _logger.LogWarning(cleanupEx, "Failed to clean up partial output file: {OutputFile}", outputFilePath);
                 }
             }
-            
+
             throw;
         }
     }
